@@ -231,34 +231,121 @@ app.put('/api/movimientos/:id', verificarToken, async (req, res) => {
 // ==========================================
 // WHATSAPP
 // ==========================================
+// ==========================================
+// WEBHOOK OMNICANAL INTELIGENTE (WhatsApp NLP V2)
+// ==========================================
 app.post('/api/whatsapp', async (req, res) => {
     res.type('text/xml');
-    const mensajeOriginal = req.body.Body.trim(); const mensaje = mensajeOriginal.toLowerCase(); const remitente = req.body.From.replace('whatsapp:', '').trim();
+    const mensajeOriginal = req.body.Body.trim();
+    
+    // 1. NORMALIZACIÓN: Quitamos mayúsculas y tildes para que no se confunda (ej: cobré = cobre)
+    const mensajeNormalizado = mensajeOriginal.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const remitente = req.body.From.replace('whatsapp:', '').trim();
+
     try {
         const userRes = await pool.query('SELECT id, nombre, email FROM usuarios WHERE telefono = $1', [remitente]);
-        if (userRes.rows.length === 0) return res.send('<Response><Message>❌ No autorizado.</Message></Response>');
+        if (userRes.rows.length === 0) return res.send('<Response><Message>❌ Tu número no está autorizado en el SaaS.</Message></Response>');
         const usuario = userRes.rows[0];
-        const montoMatch = mensaje.match(/\d+(?:\.\d+)?/);
-        if (!montoMatch) return res.send('<Response><Message>❌ Falta el monto numérico.</Message></Response>');
+
+        // 2. Extraer Monto
+        const montoMatch = mensajeNormalizado.match(/\d+(?:\.\d+)?/);
+        if (!montoMatch) return res.send('<Response><Message>❌ No detecté ningún monto numérico.</Message></Response>');
         const monto = parseFloat(montoMatch[0]);
-        const negociosRes = await pool.query('SELECT id, nombre FROM negocios WHERE usuario_id = $1 OR id IN (SELECT negocio_id FROM colaboradores WHERE email_colaborador = $2)', [usuario.id, usuario.email]);
+
+        // 3. Extraer Negocio
+        const negociosRes = await pool.query(
+            'SELECT id, nombre FROM negocios WHERE usuario_id = $1 OR id IN (SELECT negocio_id FROM colaboradores WHERE email_colaborador = $2)', 
+            [usuario.id, usuario.email]
+        );
         const misNegocios = negociosRes.rows;
-        if (misNegocios.length === 0) return res.send('<Response><Message>❌ No tienes negocios.</Message></Response>');
-        let negocio_id = null; let marcaNombre = "";
-        if (misNegocios.length === 1) { negocio_id = misNegocios[0].id; marcaNombre = misNegocios[0].nombre; } 
-        else {
-            for (let n of misNegocios) { if (mensaje.includes(n.nombre.toLowerCase().split(' ')[0])) { negocio_id = n.id; marcaNombre = n.nombre; break; } }
-            if (!negocio_id) return res.send('<Response><Message>❌ Nombra la marca (ej: Naturae).</Message></Response>');
-        }
-        const diccionario = [ { id: 'Ventas', palabras: ['venta', 'ventas', 'cobré', 'ingreso', 'cliente'] }, { id: 'Insumos', palabras: ['insumo', 'insumos', 'compra', 'mercaderia', 'proveedor'] }, { id: 'Sueldos', palabras: ['sueldo', 'sueldos', 'honorario', 'pagué'] }, { id: 'Marketing', palabras: ['marketing', 'publicidad', 'ads'] } ];
-        let categoriaElegida = 'Otros gastos'; for (let cat of diccionario) { if (cat.palabras.some(p => mensaje.includes(p))) { categoriaElegida = cat.id; break; } }
-        let tipoDeducido = 'egreso'; let esCap = false; if (categoriaElegida === 'Ventas') tipoDeducido = 'ingreso';
+        if (misNegocios.length === 0) return res.send('<Response><Message>❌ No tienes negocios creados.</Message></Response>');
         
-        // Los envíos por WhatsApp asumen pago al contado ('pagado') por defecto
-        await pool.query(`INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital, estado_pago) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pagado')`, [usuario.id, negocio_id, mensajeOriginal, categoriaElegida, 0, tipoDeducido, monto, esCap]);
-        registrarAuditoria(usuario.id, negocio_id, `[WhatsApp] Registró $${monto} en ${categoriaElegida}`, req.ip || 'Bot');
-        res.send(`<Response><Message>✅ Registrado en ${marcaNombre}: $${monto} (${categoriaElegida})</Message></Response>`);
-    } catch (error) { res.send('<Response><Message>❌ Error en servidor.</Message></Response>'); }
+        let negocio_id = null; let marcaNombre = "";
+        if (misNegocios.length === 1) { 
+            negocio_id = misNegocios[0].id; marcaNombre = misNegocios[0].nombre; 
+        } else {
+            for (let n of misNegocios) {
+                const keyword = n.nombre.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").split(' ')[0];
+                if (mensajeNormalizado.includes(keyword)) { negocio_id = n.id; marcaNombre = n.nombre; break; }
+            }
+            if (!negocio_id) return res.send('<Response><Message>❌ Tienes varias marcas. Nombra para cuál es (ej: Naturae).</Message></Response>');
+        }
+
+        // 4. Diccionario Financiero (Sin tildes)
+        const diccionario = [
+            { id: 'Ventas', palabras: ['venta', 'ventas', 'cobre', 'ingreso', 'cliente', 'cobro'] },
+            { id: 'Insumos', palabras: ['insumo', 'insumos', 'compra', 'mercaderia', 'proveedor'] },
+            { id: 'Sueldos', palabras: ['sueldo', 'sueldos', 'honorario', 'pague', 'adelanto'] },
+            { id: 'Marketing', palabras: ['marketing', 'publicidad', 'ads'] }
+        ];
+
+        let categoriaElegida = 'Otros gastos'; 
+        for (let cat of diccionario) { 
+            if (cat.palabras.some(p => mensajeNormalizado.includes(p))) { categoriaElegida = cat.id; break; } 
+        }
+
+        let tipoDeducido = 'egreso'; let esCap = false; 
+        if (categoriaElegida === 'Ventas') tipoDeducido = 'ingreso';
+
+        // 5. INTELIGENCIA FINANCIERA: Deudas, Fechas y Entidades
+        let estado_pago = 'pagado';
+        let fecha_vencimiento = null;
+        let entidad = null;
+
+        // A) Detectar Fecha (ej: 31/3 o 31-03)
+        // El Regex busca dos números separados por / o -
+        const fechaMatch = mensajeNormalizado.match(/(\d{1,2})[\/\-](\d{1,2})/);
+        if (fechaMatch) {
+            const dia = fechaMatch[1].padStart(2, '0');
+            const mes = fechaMatch[2].padStart(2, '0');
+            const ano = new Date().getFullYear();
+            fecha_vencimiento = `${ano}-${mes}-${dia}`;
+            estado_pago = 'pendiente'; // Si da una fecha, sabemos que es a crédito
+        }
+
+        // B) Detectar frases clave de deuda
+        if (mensajeNormalizado.includes('a pagar') || mensajeNormalizado.includes('pendiente') || mensajeNormalizado.includes('debe')) {
+            estado_pago = 'pendiente';
+        }
+
+        // C) Detectar Entidad (Busca la palabra después de "venta" o "cobre a")
+        const entidadMatch = mensajeOriginal.match(/(?:venta|ventas a|cobre a|cobré a|pague a|pagué a) ([a-zA-Z]+)/i);
+        if (entidadMatch) {
+            entidad = entidadMatch[1]; // Agarra "cata" de "cobre a cata"
+        } else if (mensajeNormalizado.includes('venta ')) {
+            const parts = mensajeOriginal.split(/venta /i);
+            if (parts[1]) entidad = parts[1].split(' ')[0]; // Agarra "colven" de "venta colven"
+        }
+
+        // Si la entidad detectada fue el monto por accidente, la anulamos
+        if (entidad && entidad.match(/\d+/)) entidad = null;
+
+        const concepto = mensajeOriginal;
+
+        // 6. Guardar en Base de Datos con todos los nuevos campos
+        await pool.query(
+            `INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital, estado_pago, entidad, fecha_vencimiento) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [usuario.id, negocio_id, concepto, categoriaElegida, 0, tipoDeducido, monto, esCap, estado_pago, entidad, fecha_vencimiento]
+        );
+        
+        // Registro Forense
+        registrarAuditoria(usuario.id, negocio_id, `[WhatsApp] Registró $${monto} en ${categoriaElegida} (${estado_pago.toUpperCase()})`, req.ip || 'Bot');
+
+        // 7. Respuesta estructurada para WhatsApp
+        const msjEntidad = entidad ? `\n👤 A nombre de: ${entidad.charAt(0).toUpperCase() + entidad.slice(1)}` : '';
+        let msjDeuda = '\n✅ PAGADO Y EN CAJA';
+        if (estado_pago === 'pendiente') {
+            const fText = fecha_vencimiento ? fecha_vencimiento.split('-').reverse().join('/') : 'Sin fecha asignada';
+            msjDeuda = `\n⏳ PENDIENTE DE COBRO/PAGO\n📅 Vence el: ${fText}`;
+        }
+
+        res.send(`<Response><Message>🏢 ${marcaNombre}\n💰 $${monto} clasificado en ${categoriaElegida}${msjEntidad}${msjDeuda}</Message></Response>`);
+
+    } catch (error) {
+        console.error("Error en WhatsApp NLP:", error);
+        res.send('<Response><Message>❌ Ups, error de procesamiento en el servidor.</Message></Response>');
+    }
 });
 
 app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port} listo con Cuentas Corrientes`); });
