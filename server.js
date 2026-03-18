@@ -1,4 +1,4 @@
-// server.js - API Backend Completo (Suscripciones, Forense y WhatsApp)
+// server.js - API Backend Completo (Con Cuentas Corrientes)
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -24,7 +24,7 @@ const enviarCorreo = (destino, asunto, mensaje) => { console.log(`\n📧 [EMAIL 
 
 const registrarAuditoria = async (usuario_id, negocio_id, accion, ip) => {
     try { await pool.query('INSERT INTO logs_auditoria (usuario_id, negocio_id, accion, ip_origen) VALUES ($1, $2, $3, $4)', [usuario_id, negocio_id, accion, ip]); } 
-    catch (error) { console.error("Error guardando log:", error.message); }
+    catch (error) { console.error("Error log:", error.message); }
 };
 
 const verificarToken = (req, res, next) => {
@@ -37,80 +37,44 @@ const verificarToken = (req, res, next) => {
 };
 
 // ==========================================
-// AUTH Y MOTOR DE SUSCRIPCIONES (ACTUALIZADO)
+// AUTH Y SUSCRIPCIONES
 // ==========================================
 app.post('/api/register', async (req, res) => {
     const { email, password, nombre, apellido, pais, telefono } = req.body;
     try {
         const hash = await bcrypt.hash(password, 10);
         const result = await pool.query('INSERT INTO usuarios (email, password_hash, nombre, apellido, pais, telefono) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, nombre', [email, hash, nombre, apellido, pais, telefono]);
-        enviarCorreo(email, "¡Bienvenido a Tesorería SaaS!", `Hola ${nombre}, disfruta tus 15 días de prueba gratuita.`);
+        enviarCorreo(email, "¡Bienvenido a Tesorería SaaS!", `Hola ${nombre}, disfruta tus 15 días.`);
         res.status(201).json(result.rows[0]);
-    } catch (error) { res.status(400).json({ error: 'El email ya está registrado' }); }
+    } catch (error) { res.status(400).json({ error: 'Email ya registrado' }); }
 });
 
 app.post('/api/login', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [req.body.email]);
-        if (result.rows.length === 0 || !(await bcrypt.compare(req.body.password, result.rows[0].password_hash))) {
-            return res.status(400).json({ error: 'Credenciales inválidas' });
-        }
+        if (result.rows.length === 0 || !(await bcrypt.compare(req.body.password, result.rows[0].password_hash))) return res.status(400).json({ error: 'Credenciales inválidas' });
         
-        const user = result.rows[0];
-        const hoy = new Date();
-        let diasRestantes = 0;
-        let estadoPlan = user.plan_actual;
-
-        // Lógica de cálculo de vencimientos
+        const user = result.rows[0]; const hoy = new Date(); let diasRestantes = 0; let estadoPlan = user.plan_actual;
         if (user.es_premium && user.vencimiento_suscripcion) {
-            const vencimiento = new Date(user.vencimiento_suscripcion);
-            diasRestantes = Math.ceil((vencimiento - hoy) / (1000 * 60 * 60 * 24));
-            
-            // Si los días llegaron a 0 o negativo, el plan premium expiró
-            if (diasRestantes <= 0) {
-                estadoPlan = 'Expirado';
-                // Opcional: Podrías hacer un UPDATE aquí para quitarle el premium en la BD
-            }
+            diasRestantes = Math.ceil((new Date(user.vencimiento_suscripcion) - hoy) / (1000 * 60 * 60 * 24));
+            if (diasRestantes <= 0) estadoPlan = 'Expirado';
         } else {
-            // Lógica para los que están en la prueba de 15 días
-            const fechaCreacion = new Date(user.fecha_creacion);
-            const diasPasados = Math.floor((hoy - fechaCreacion) / (1000 * 60 * 60 * 24));
-            diasRestantes = 15 - diasPasados;
+            diasRestantes = 15 - Math.floor((hoy - new Date(user.fecha_creacion)) / (1000 * 60 * 60 * 24));
         }
 
-        const payload = { 
-            id: user.id, 
-            email: user.email, 
-            nombre: user.nombre,
-            es_premium: user.es_premium,
-            plan_actual: estadoPlan,
-            dias_restantes: diasRestantes,
-            vencimiento: user.vencimiento_suscripcion // Mandamos la fecha exacta al frontend
-        };
-        
+        const payload = { id: user.id, email: user.email, nombre: user.nombre, es_premium: user.es_premium, plan_actual: estadoPlan, dias_restantes: diasRestantes, vencimiento: user.vencimiento_suscripcion };
         res.json({ token: jwt.sign(payload, SECRET_KEY, { expiresIn: '8h' }), usuario: payload });
     } catch (error) { res.status(500).json({ error: 'Error en servidor' }); }
 });
 
 app.post('/api/checkout', verificarToken, async (req, res) => {
-    const { tipo_plan } = req.body; // Recibimos si eligió 'Mensual' o 'Anual'
-    const diasASumar = tipo_plan === 'Anual' ? 365 : 30;
-
+    const { tipo_plan } = req.body; const dias = tipo_plan === 'Anual' ? 365 : 30;
     try {
-        // Le damos el nivel Premium, guardamos el nombre del plan, y le sumamos los días desde HOY
-        await pool.query(
-            `UPDATE usuarios 
-             SET es_premium = TRUE, plan_actual = $1, vencimiento_suscripcion = NOW() + INTERVAL '1 day' * $2 
-             WHERE id = $3`, 
-            [tipo_plan, diasASumar, req.usuario_id]
-        );
-        res.json({ mensaje: `¡Suscripción ${tipo_plan} activada exitosamente!` });
-    } catch (error) { res.status(500).json({ error: 'Error en la pasarela de pagos.' }); }
+        await pool.query(`UPDATE usuarios SET es_premium = TRUE, plan_actual = $1, vencimiento_suscripcion = NOW() + INTERVAL '1 day' * $2 WHERE id = $3`, [tipo_plan, dias, req.usuario_id]);
+        res.json({ mensaje: `¡Suscripción ${tipo_plan} activada!` });
+    } catch (error) { res.status(500).json({ error: 'Error pago' }); }
 });
 
-// ==========================================
-// RESTO DEL SISTEMA (INTACTO)
-// ==========================================
 app.post('/api/recuperar', async (req, res) => {
     const { email } = req.body;
     try {
@@ -118,56 +82,58 @@ app.post('/api/recuperar', async (req, res) => {
         if (result.rows.length > 0) {
             const resetToken = crypto.randomBytes(32).toString('hex');
             await pool.query("UPDATE usuarios SET reset_token = $1, reset_expires = NOW() + INTERVAL '1 hour' WHERE email = $2", [resetToken, email]);
-            enviarCorreo(email, "Recuperación de Contraseña", `Usa este código: ${resetToken}`);
+            enviarCorreo(email, "Recuperación", `Código: ${resetToken}`);
         }
         res.json({ mensaje: 'Instrucciones enviadas.' });
-    } catch (error) { res.status(500).json({ error: 'Error procesando solicitud' }); }
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
 app.put('/api/usuarios/password', verificarToken, async (req, res) => {
     const { passwordActual, passwordNueva } = req.body;
     try {
         const result = await pool.query('SELECT password_hash FROM usuarios WHERE id = $1', [req.usuario_id]);
-        if (!(await bcrypt.compare(passwordActual, result.rows[0].password_hash))) return res.status(400).json({ error: 'Contraseña actual incorrecta' });
-        const nuevoHash = await bcrypt.hash(passwordNueva, 10);
-        await pool.query('UPDATE usuarios SET password_hash = $1 WHERE id = $2', [nuevoHash, req.usuario_id]);
+        if (!(await bcrypt.compare(passwordActual, result.rows[0].password_hash))) return res.status(400).json({ error: 'Contraseña incorrecta' });
+        await pool.query('UPDATE usuarios SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(passwordNueva, 10), req.usuario_id]);
         res.json({ mensaje: 'Contraseña actualizada' });
-    } catch (error) { res.status(500).json({ error: 'Error al cambiar contraseña' }); }
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
 app.delete('/api/usuarios', verificarToken, async (req, res) => {
     try { await pool.query('DELETE FROM usuarios WHERE id = $1', [req.usuario_id]); res.json({ mensaje: 'Cuenta eliminada' }); } 
-    catch (error) { res.status(500).json({ error: 'Error al eliminar cuenta' }); }
+    catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
+// ==========================================
+// ADMIN Y AUDITORÍA
+// ==========================================
 app.get('/api/admin/stats', verificarToken, async (req, res) => {
-    if (req.usuario_id !== 1) return res.status(403).json({ error: 'Acceso denegado.' });
+    if (req.usuario_id !== 1) return res.status(403).json({ error: 'Denegado.' });
     try {
-        const users = await pool.query('SELECT COUNT(*) FROM usuarios');
-        const negocios = await pool.query('SELECT COUNT(*) FROM negocios');
-        const movs = await pool.query('SELECT COUNT(*) FROM movimientos_tesoreria');
+        const users = await pool.query('SELECT COUNT(*) FROM usuarios'); const negocios = await pool.query('SELECT COUNT(*) FROM negocios'); const movs = await pool.query('SELECT COUNT(*) FROM movimientos_tesoreria');
         res.json({ total_usuarios: users.rows[0].count, total_negocios: negocios.rows[0].count, total_movimientos: movs.rows[0].count });
-    } catch (error) { res.status(500).json({ error: 'Error obteniendo métricas' }); }
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
 app.get('/api/auditoria/:negocio_id', verificarToken, async (req, res) => {
     try {
         const check = await pool.query('SELECT id FROM negocios WHERE id = $1 AND usuario_id = $2', [req.params.negocio_id, req.usuario_id]);
-        if (check.rows.length === 0) return res.status(403).json({ error: 'Acceso denegado.' });
+        if (check.rows.length === 0) return res.status(403).json({ error: 'Denegado.' });
         const logs = await pool.query(`SELECT l.*, u.nombre, u.email FROM logs_auditoria l JOIN usuarios u ON l.usuario_id = u.id WHERE l.negocio_id = $1 ORDER BY l.fecha DESC LIMIT 50`, [req.params.negocio_id]);
         res.json(logs.rows);
-    } catch (error) { res.status(500).json({ error: 'Error obteniendo auditoría' }); }
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
+// ==========================================
+// NEGOCIOS Y COLABORADORES
+// ==========================================
 app.post('/api/colaboradores', verificarToken, async (req, res) => {
     const { negocio_id, email_invitado } = req.body;
     try {
         const check = await pool.query('SELECT id FROM negocios WHERE id = $1 AND usuario_id = $2', [negocio_id, req.usuario_id]);
         if (check.rows.length === 0) return res.status(403).json({ error: 'Solo el dueño puede invitar.' });
         await pool.query('INSERT INTO colaboradores (negocio_id, email_colaborador) VALUES ($1, $2)', [negocio_id, email_invitado]);
-        registrarAuditoria(req.usuario_id, negocio_id, `Invitó al usuario ${email_invitado}`, req.ip);
-        res.json({ mensaje: 'Invitación enviada.' });
-    } catch (error) { res.status(500).json({ error: 'Error al invitar.' }); }
+        registrarAuditoria(req.usuario_id, negocio_id, `Invitó a ${email_invitado}`, req.ip); res.json({ mensaje: 'Enviada.' });
+    } catch (error) { res.status(500).json({ error: 'Error.' }); }
 });
 
 app.post('/api/negocios', verificarToken, async (req, res) => {
@@ -182,22 +148,60 @@ app.get('/api/negocios', verificarToken, async (req, res) => {
 
 app.delete('/api/negocios/:id', verificarToken, async (req, res) => {
     const result = await pool.query('DELETE FROM negocios WHERE id = $1 AND usuario_id = $2 RETURNING *', [req.params.id, req.usuario_id]);
-    if(result.rowCount === 0) return res.status(404).json({error: 'No autorizado'});
-    res.json({ mensaje: 'Eliminado' });
+    if(result.rowCount === 0) return res.status(404).json({error: 'No autorizado'}); res.json({ mensaje: 'Eliminado' });
 });
 
+// ==========================================
+// MOVIMIENTOS Y CUENTAS CORRIENTES (NUEVO)
+// ==========================================
 app.post('/api/movimientos', verificarToken, async (req, res) => {
-    const { negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital } = req.body;
+    // NUEVO: Agregamos estado_pago, entidad y fecha_vencimiento
+    const { negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital, estado_pago, entidad, fecha_vencimiento } = req.body;
     try {
-        const result = await pool.query(`INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`, [req.usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital]);
-        registrarAuditoria(req.usuario_id, negocio_id, `Creó un ${tipo} de $${monto} en ${categoria_contable}.`, req.ip);
+        const result = await pool.query(
+            `INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital, estado_pago, entidad, fecha_vencimiento) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+            [req.usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital, estado_pago || 'pagado', entidad || null, fecha_vencimiento || null]
+        );
+        registrarAuditoria(req.usuario_id, negocio_id, `Registró un ${tipo} de $${monto} (${estado_pago || 'pagado'}).`, req.ip);
         res.status(201).json(result.rows[0]);
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/movimientos', verificarToken, async (req, res) => {
-    const result = await pool.query(`SELECT m.*, n.nombre as empresa_nombre FROM movimientos_tesoreria m JOIN negocios n ON m.negocio_id = n.id WHERE n.usuario_id = $1 OR n.id IN (SELECT negocio_id FROM colaboradores WHERE email_colaborador = $2) ORDER BY m.fecha_registro DESC`, [req.usuario_id, req.usuario_email]);
+    const result = await pool.query(
+        `SELECT m.*, n.nombre as empresa_nombre FROM movimientos_tesoreria m 
+         JOIN negocios n ON m.negocio_id = n.id 
+         WHERE n.usuario_id = $1 OR n.id IN (SELECT negocio_id FROM colaboradores WHERE email_colaborador = $2) 
+         ORDER BY m.fecha_registro DESC`, 
+        [req.usuario_id, req.usuario_email]
+    );
     res.json(result.rows);
+});
+
+// NUEVO: Ruta específica para el panel de Cuentas Corrientes (trae solo lo pendiente)
+app.get('/api/deudas/:negocio_id', verificarToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT * FROM movimientos_tesoreria 
+             WHERE negocio_id = $1 AND estado_pago = 'pendiente' 
+             ORDER BY fecha_vencimiento ASC`, 
+            [req.params.negocio_id]
+        );
+        res.json(result.rows);
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo deudas' }); }
+});
+
+// NUEVO: Ruta rápida para marcar un ticket pendiente como "Pagado"
+app.put('/api/movimientos/:id/pagar', verificarToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `UPDATE movimientos_tesoreria SET estado_pago = 'pagado' WHERE id = $1 AND negocio_id IN (SELECT id FROM negocios WHERE usuario_id = $2 OR id IN (SELECT negocio_id FROM colaboradores WHERE email_colaborador = $3)) RETURNING *`,
+            [req.params.id, req.usuario_id, req.usuario_email]
+        );
+        registrarAuditoria(req.usuario_id, result.rows[0].negocio_id, `Marcó como PAGADO el asiento #${req.params.id}.`, req.ip);
+        res.json(result.rows[0]);
+    } catch (error) { res.status(500).json({ error: 'Error al procesar el pago' }); }
 });
 
 app.delete('/api/movimientos/:id', verificarToken, async (req, res) => {
@@ -212,14 +216,21 @@ app.delete('/api/movimientos/:id', verificarToken, async (req, res) => {
 });
 
 app.put('/api/movimientos/:id', verificarToken, async (req, res) => {
-    const { negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital } = req.body;
+    const { negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital, estado_pago, entidad, fecha_vencimiento } = req.body;
     try {
-        const result = await pool.query(`UPDATE movimientos_tesoreria SET negocio_id=$1, concepto=$2, categoria_contable=$3, cantidad_unidades=$4, tipo=$5, monto=$6, es_capital=$7 WHERE id=$8 AND usuario_id=$9 RETURNING *`, [negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital, req.params.id, req.usuario_id]);
-        registrarAuditoria(req.usuario_id, negocio_id, `Modificó asiento a $${monto}.`, req.ip);
+        const result = await pool.query(
+            `UPDATE movimientos_tesoreria SET negocio_id=$1, concepto=$2, categoria_contable=$3, cantidad_unidades=$4, tipo=$5, monto=$6, es_capital=$7, estado_pago=$8, entidad=$9, fecha_vencimiento=$10 
+             WHERE id=$11 AND usuario_id=$12 RETURNING *`,
+            [negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, esCapital, estado_pago, entidad, fecha_vencimiento, req.params.id, req.usuario_id]
+        );
+        registrarAuditoria(req.usuario_id, negocio_id, `Modificó asiento a $${monto}. Estado: ${estado_pago}`, req.ip);
         res.json(result.rows[0]);
     } catch (error) { res.status(500).json({ error: 'Error al actualizar' }); }
 });
 
+// ==========================================
+// WHATSAPP
+// ==========================================
 app.post('/api/whatsapp', async (req, res) => {
     res.type('text/xml');
     const mensajeOriginal = req.body.Body.trim(); const mensaje = mensajeOriginal.toLowerCase(); const remitente = req.body.From.replace('whatsapp:', '').trim();
@@ -242,10 +253,12 @@ app.post('/api/whatsapp', async (req, res) => {
         const diccionario = [ { id: 'Ventas', palabras: ['venta', 'ventas', 'cobré', 'ingreso', 'cliente'] }, { id: 'Insumos', palabras: ['insumo', 'insumos', 'compra', 'mercaderia', 'proveedor'] }, { id: 'Sueldos', palabras: ['sueldo', 'sueldos', 'honorario', 'pagué'] }, { id: 'Marketing', palabras: ['marketing', 'publicidad', 'ads'] } ];
         let categoriaElegida = 'Otros gastos'; for (let cat of diccionario) { if (cat.palabras.some(p => mensaje.includes(p))) { categoriaElegida = cat.id; break; } }
         let tipoDeducido = 'egreso'; let esCap = false; if (categoriaElegida === 'Ventas') tipoDeducido = 'ingreso';
-        await pool.query(`INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [usuario.id, negocio_id, mensajeOriginal, categoriaElegida, 0, tipoDeducido, monto, esCap]);
+        
+        // Los envíos por WhatsApp asumen pago al contado ('pagado') por defecto
+        await pool.query(`INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital, estado_pago) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pagado')`, [usuario.id, negocio_id, mensajeOriginal, categoriaElegida, 0, tipoDeducido, monto, esCap]);
         registrarAuditoria(usuario.id, negocio_id, `[WhatsApp] Registró $${monto} en ${categoriaElegida}`, req.ip || 'Bot');
         res.send(`<Response><Message>✅ Registrado en ${marcaNombre}: $${monto} (${categoriaElegida})</Message></Response>`);
     } catch (error) { res.send('<Response><Message>❌ Error en servidor.</Message></Response>'); }
 });
 
-app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port} listo con Planes de Suscripción`); });
+app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port} listo con Cuentas Corrientes`); });
