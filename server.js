@@ -1,4 +1,4 @@
-// server.js - API Backend Completo (Backoffice CEO)
+// server.js - API Backend Completo (Sin Mercado Pago)
 
 const express = require('express');
 const cors = require('cors');
@@ -6,7 +6,6 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { MercadoPagoConfig, Preference } = require('mercadopago');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -58,7 +57,7 @@ app.post('/api/login', async (req, res) => {
         
         const user = result.rows[0];
         
-        // NUEVO: Guardamos en el reloj a qué hora entró (Para el DAU)
+        // Guardamos en el reloj a qué hora entró (Para el DAU)
         await pool.query("UPDATE usuarios SET ultimo_login = NOW() WHERE id = $1", [user.id]);
 
         const hoy = new Date(); let diasRestantes = 0; let estadoPlan = user.plan_actual;
@@ -106,30 +105,20 @@ app.delete('/api/usuarios', verificarToken, async (req, res) => {
 });
 
 // ==========================================
-// PASARELA DE PAGOS REAL (Mercado Pago)
+// SIMULADOR DE PASARELA DE PAGOS
 // ==========================================
 app.post('/api/checkout', verificarToken, async (req, res) => {
-    const { tipo_plan } = req.body; const precio = tipo_plan === 'Anual' ? 749990 : 74999;
+    const { tipo_plan } = req.body; 
+    const diasASumar = tipo_plan === 'Anual' ? 365 : 30;
     try {
-        const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN || 'TEST-TOKEN' });
-        const preference = new Preference(client);
-        const result = await preference.create({
-            body: { items: [{ id: tipo_plan, title: `SaaS Tesorería - Plan ${tipo_plan}`, quantity: 1, unit_price: precio, currency_id: 'ARS' }], metadata: { usuario_id: req.usuario_id, tipo_plan: tipo_plan }, back_urls: { success: 'https://TU-LINK-DE-NETLIFY.netlify.app/', failure: 'https://TU-LINK-DE-NETLIFY.netlify.app/' }, auto_return: 'approved', notification_url: 'https://api-tesoreria.onrender.com/api/webhook/mercadopago' }
-        });
-        res.json({ init_point: result.init_point });
-    } catch (error) { res.status(500).json({ error: 'Error pago' }); }
-});
-
-app.post('/api/webhook/mercadopago', async (req, res) => {
-    res.sendStatus(200); const pago_id = req.query.data?.id || req.body.data?.id;
-    if ((req.query.type || req.body.type) === 'payment' && pago_id) {
-        try {
-            const response = await fetch(`https://api.mercadopago.com/v1/payments/${pago_id}`, { headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` } });
-            const pago = await response.json();
-            if (pago.status === 'approved') {
-                await pool.query(`UPDATE usuarios SET es_premium = TRUE, plan_actual = $1, vencimiento_suscripcion = NOW() + INTERVAL '1 day' * $2 WHERE id = $3`, [pago.metadata.tipo_plan, pago.metadata.tipo_plan === 'Anual' ? 365 : 30, pago.metadata.usuario_id]);
-            }
-        } catch (error) {}
+        await pool.query(
+            `UPDATE usuarios SET es_premium = TRUE, plan_actual = $1, vencimiento_suscripcion = NOW() + INTERVAL '1 day' * $2 WHERE id = $3`, 
+            [tipo_plan, diasASumar, req.usuario_id]
+        );
+        // Simulamos que MercadoPago aprobó y nos mandó de vuelta
+        res.json({ mensaje: `¡Suscripción ${tipo_plan} simulada y activada con éxito!` });
+    } catch (error) { 
+        res.status(500).json({ error: 'Error simulando pago' }); 
     }
 });
 
@@ -142,11 +131,7 @@ app.get('/api/admin/stats', verificarToken, async (req, res) => {
         const users = await pool.query('SELECT COUNT(*) FROM usuarios');
         const negocios = await pool.query('SELECT COUNT(*) FROM negocios');
         const movs = await pool.query('SELECT COUNT(*) FROM movimientos_tesoreria');
-        
-        // NUEVO: DAU (Usuarios que entraron en las últimas 24hs)
         const dau = await pool.query("SELECT COUNT(*) FROM usuarios WHERE ultimo_login >= NOW() - INTERVAL '24 hours'");
-        
-        // NUEVO: MRR (Dinero recurrente). Si paga anual (749k), equivale a $62.499 por mes matemáticamente.
         const mrrQuery = await pool.query("SELECT SUM(CASE WHEN plan_actual = 'Mensual' THEN 74999 WHEN plan_actual = 'Anual' THEN 62499 ELSE 0 END) as total_mrr FROM usuarios WHERE es_premium = TRUE AND plan_actual != 'Expirado'");
 
         res.json({ 
@@ -159,7 +144,6 @@ app.get('/api/admin/stats', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error métricas' }); }
 });
 
-// NUEVO: Lista CRUD de Usuarios
 app.get('/api/admin/usuarios', verificarToken, async (req, res) => {
     if (req.usuario_id !== 1) return res.status(403).json({ error: 'Denegado.' });
     try {
@@ -168,7 +152,6 @@ app.get('/api/admin/usuarios', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error usuarios' }); }
 });
 
-// NUEVO: Regalar Premium
 app.put('/api/admin/usuarios/:id/premium', verificarToken, async (req, res) => {
     if (req.usuario_id !== 1) return res.status(403).json({ error: 'Denegado.' });
     try {
@@ -177,7 +160,6 @@ app.put('/api/admin/usuarios/:id/premium', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
-// NUEVO: Extender Trial Mágicamente (Le adelantamos la fecha de creación en la BD)
 app.put('/api/admin/usuarios/:id/trial', verificarToken, async (req, res) => {
     if (req.usuario_id !== 1) return res.status(403).json({ error: 'Denegado.' });
     try {
@@ -186,7 +168,6 @@ app.put('/api/admin/usuarios/:id/trial', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
-// NUEVO: Borrar Usuario Enemigo
 app.delete('/api/admin/usuarios/:id', verificarToken, async (req, res) => {
     if (req.usuario_id !== 1) return res.status(403).json({ error: 'Denegado.' });
     try {
@@ -195,7 +176,6 @@ app.delete('/api/admin/usuarios/:id', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
 
-// NUEVO: Iniciar Sesión como el Cliente (Impersonation)
 app.post('/api/admin/impersonate/:id', verificarToken, async (req, res) => {
     if (req.usuario_id !== 1) return res.status(403).json({ error: 'Denegado.' });
     try {
@@ -204,8 +184,6 @@ app.post('/api/admin/impersonate/:id', verificarToken, async (req, res) => {
         
         const user = result.rows[0];
         const payload = { id: user.id, email: user.email, nombre: user.nombre, es_premium: user.es_premium, plan_actual: user.plan_actual, dias_restantes: 15, vencimiento: user.vencimiento_suscripcion };
-        
-        // Firmamos un JWT real a nombre del cliente y te lo mandamos
         res.json({ token: jwt.sign(payload, SECRET_KEY, { expiresIn: '2h' }), usuario: payload });
     } catch (error) { res.status(500).json({ error: 'Error' }); }
 });
@@ -303,4 +281,4 @@ app.post('/api/whatsapp', async (req, res) => {
     } catch (error) { res.send('<Response><Message>❌ Error servidor.</Message></Response>'); }
 });
 
-app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port} (Backoffice CEO Activo)`); });
+app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port} (Backoffice Listo sin MP)`); });
