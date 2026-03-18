@@ -145,63 +145,92 @@ app.put('/api/movimientos/:id', verificarToken, async (req, res) => {
 // ==========================================
 // NUEVO: WEBHOOK OMNICANAL PARA WHATSAPP
 // ==========================================
+// ==========================================
+// WEBHOOK OMNICANAL INTELIGENTE (Lectura Natural)
+// ==========================================
 app.post('/api/whatsapp', async (req, res) => {
-    res.type('text/xml'); // Twilio exige que le respondamos en formato XML
-    
-    const mensaje = req.body.Body; // Lo que escribiste en el chat
-    const remitente = req.body.From; // Tu número (ej: whatsapp:+549112345678)
+    res.type('text/xml');
+    const mensajeOriginal = req.body.Body.trim();
+    const mensaje = mensajeOriginal.toLowerCase(); // Pasamos todo a minúsculas para analizarlo fácil
+    const remitente = req.body.From.replace('whatsapp:', '').trim();
 
     try {
-        // 1. Limpiar el número (quitarle la palabra 'whatsapp:')
-        const telefonoLimpiado = remitente.replace('whatsapp:', '').trim();
-
-        // 2. Seguridad: Buscar al usuario en la BD usando ese teléfono
-        const userRes = await pool.query('SELECT id, nombre FROM usuarios WHERE telefono = $1', [telefonoLimpiado]);
-        if (userRes.rows.length === 0) {
-            return res.send('<Response><Message>❌ Ciberseguridad: Este número de teléfono no está autorizado en el SaaS.</Message></Response>');
-        }
+        // 1. Validar Ciberseguridad
+        const userRes = await pool.query('SELECT id, nombre FROM usuarios WHERE telefono = $1', [remitente]);
+        if (userRes.rows.length === 0) return res.send('<Response><Message>❌ Tu número no está autorizado en el SaaS.</Message></Response>');
         const usuario = userRes.rows[0];
 
-        // 3. Entender el mensaje. Formato esperado: Monto, Categoria, Marca, Detalle
-        // Ej: 15000, Insumos, Naturae, Compra de frascos
-        const partes = mensaje.split(',');
-        if (partes.length < 3) {
-             return res.send('<Response><Message>⚠️ Formato incorrecto.\nUsa comas así: Monto, Categoria, Marca, Detalle (Opcional)\nEj: 15000, Ventas, Naturae, Cliente local</Message></Response>');
+        // 2. Extraer el Monto (Busca automáticamente cualquier número en el texto)
+        const montoMatch = mensaje.match(/\d+(?:\.\d+)?/);
+        if (!montoMatch) return res.send('<Response><Message>❌ No detecté ningún monto. Por favor, incluye un número (ej: 5000).</Message></Response>');
+        const monto = parseFloat(montoMatch[0]);
+
+        // 3. Identificar la Marca (Unidad de Negocio)
+        const negociosRes = await pool.query('SELECT id, nombre FROM negocios WHERE usuario_id = $1', [usuario.id]);
+        const misNegocios = negociosRes.rows;
+        if (misNegocios.length === 0) return res.send('<Response><Message>❌ No tienes ningún negocio creado en la plataforma.</Message></Response>');
+
+        let negocio_id = null;
+        let marcaNombre = "";
+        
+        if (misNegocios.length === 1) {
+            // Si solo tiene una marca, se la asigna automáticamente (no hace falta nombrarla)
+            negocio_id = misNegocios[0].id;
+            marcaNombre = misNegocios[0].nombre;
+        } else {
+            // Si tiene varias, busca la primera palabra del negocio en el mensaje (ej: busca "exquisito" para "Exquisito Lunchtime")
+            for (let n of misNegocios) {
+                const palabraClave = n.nombre.toLowerCase().split(' ')[0];
+                if (mensaje.includes(palabraClave)) {
+                    negocio_id = n.id;
+                    marcaNombre = n.nombre;
+                    break;
+                }
+            }
+            if (!negocio_id) return res.send('<Response><Message>❌ Tienes varias marcas. Por favor nombra para cuál es este movimiento (ej: "Naturae" o "Exquisito").</Message></Response>');
         }
 
-        const monto = parseFloat(partes[0].trim());
-        const categoriaElegida = partes[1].trim();
-        const marcaNombre = partes[2].trim();
-        const concepto = partes[3] ? partes[3].trim() : 'Carga rápida por WhatsApp';
+        // 4. Diccionario de Sinónimos para Categorías
+        const diccionario = [
+            { id: 'Ventas', palabras: ['venta', 'ventas', 'cobré', 'ingreso', 'cliente'] },
+            { id: 'Insumos', palabras: ['insumo', 'insumos', 'compra', 'mercaderia', 'proveedor', 'frascos', 'materia prima'] },
+            { id: 'Sueldos', palabras: ['sueldo', 'sueldos', 'honorario', 'pagué a', 'adelanto'] },
+            { id: 'Marketing', palabras: ['marketing', 'publicidad', 'ads', 'meta', 'instagram'] },
+            { id: 'Combustible y peaje', palabras: ['nafta', 'combustible', 'peaje', 'gasolina', 'ypf', 'shell', 'axion'] },
+            { id: 'Luz', palabras: ['luz', 'edenor', 'edesur'] },
+            { id: 'Gas', palabras: ['gas', 'metrogas'] },
+            { id: 'Limpieza', palabras: ['limpieza', 'articulos de limpieza'] }
+        ];
 
-        // 4. Buscar la marca (Negocio) en la base de datos
-        // Usamos ILIKE para que no importe si escribes "naturae" o "Naturae"
-        const negocioRes = await pool.query('SELECT id FROM negocios WHERE usuario_id = $1 AND nombre ILIKE $2', [usuario.id, `%${marcaNombre}%`]);
-        if (negocioRes.rows.length === 0) {
-            return res.send(`<Response><Message>❌ No encontré la marca "${marcaNombre}". Revisa cómo está escrita.</Message></Response>`);
+        let categoriaElegida = 'Otros gastos'; // Si no entiende de qué hablas, va a "Otros gastos"
+        for (let cat of diccionario) {
+            if (cat.palabras.some(p => mensaje.includes(p))) {
+                categoriaElegida = cat.id;
+                break;
+            }
         }
-        const negocio_id = negocioRes.rows[0].id;
 
-        // 5. Motor de Deducción (Igual que en la Web)
+        // 5. Motor de Deducción (Ingreso/Egreso)
         let tipoDeducido = 'egreso';
         let esCap = false;
-        if (categoriaElegida.toLowerCase() === 'ventas') tipoDeducido = 'ingreso';
-        else if (categoriaElegida.toLowerCase() === 'aporte de capital') { tipoDeducido = 'ingreso'; esCap = true; }
-        else if (categoriaElegida.toLowerCase() === 'retiro de socio') { tipoDeducido = 'egreso'; esCap = true; }
+        if (categoriaElegida === 'Ventas') tipoDeducido = 'ingreso';
 
-        // 6. Inyectar en la Bóveda de Neon
+        // 6. El detalle del registro será literalmente la frase entera que mandaste
+        const concepto = mensajeOriginal;
+
+        // 7. Inyectar a PostgreSQL
         await pool.query(
             `INSERT INTO movimientos_tesoreria (usuario_id, negocio_id, concepto, categoria_contable, cantidad_unidades, tipo, monto, es_capital)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
             [usuario.id, negocio_id, concepto, categoriaElegida, 0, tipoDeducido, monto, esCap]
         );
 
-        // 7. Responder al chat de WhatsApp con el éxito
-        res.send(`<Response><Message>✅ ¡Listo, ${usuario.nombre}!\nSe registró un ${tipoDeducido} de $${monto} en la caja de ${marcaNombre}.</Message></Response>`);
+        // 8. Respuesta amigable por WhatsApp
+        res.send(`<Response><Message>✅ ¡Registrado con éxito!\n💰 $${monto}\n🏢 ${marcaNombre}\n📂 Se clasificó como: ${categoriaElegida}</Message></Response>`);
 
     } catch (error) {
-        console.error("Error en WhatsApp Bot:", error);
-        res.send('<Response><Message>❌ Error interno en los servidores de Render al procesar el mensaje.</Message></Response>');
+        console.error(error);
+        res.send('<Response><Message>❌ Uy, hubo un problema técnico en el servidor guardando el dato.</Message></Response>');
     }
 });
 app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port}`); });
