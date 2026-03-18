@@ -1,4 +1,4 @@
-// server.js - API Backend Completo (SaaS Premium con Branding)
+// server.js - API Backend Completo (SaaS Premium)
 
 const express = require('express');
 const cors = require('cors');
@@ -134,15 +134,14 @@ app.delete('/api/usuarios', verificarToken, async (req, res) => {
 });
 
 // ==========================================
-// PASARELA DE PAGOS REAL (Mercado Pago)
+// PASARELA DE PAGOS REAL (Precios Actualizados)
 // ==========================================
 app.post('/api/checkout', verificarToken, async (req, res) => {
     const { tipo_plan } = req.body; 
-    const precio = tipo_plan === 'Anual' ? 144000 : 15000;
+    const precio = tipo_plan === 'Anual' ? 749990 : 74999;
     const descripcion = `SaaS Tesorería - Plan ${tipo_plan}`;
 
     try {
-        // Usa tu MP_ACCESS_TOKEN de las variables de entorno de Render
         const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN || 'TEST-TOKEN' });
         const preference = new Preference(client);
 
@@ -220,7 +219,7 @@ app.get('/api/auditoria/:negocio_id', verificarToken, async (req, res) => {
 });
 
 // ==========================================
-// NEGOCIOS Y BRANDING (NUEVO)
+// NEGOCIOS Y BRANDING
 // ==========================================
 app.post('/api/colaboradores', verificarToken, async (req, res) => {
     const { negocio_id, email_invitado } = req.body;
@@ -249,14 +248,10 @@ app.get('/api/negocios', verificarToken, async (req, res) => {
     res.json(result.rows);
 });
 
-// NUEVO: Guardar el Tema Elegido (Dark Mode / Colores)
 app.put('/api/negocios/:id/tema', verificarToken, async (req, res) => {
     const { tema } = req.body;
     try {
-        const result = await pool.query(
-            'UPDATE negocios SET tema = $1 WHERE id = $2 AND usuario_id = $3 RETURNING *',
-            [tema, req.params.id, req.usuario_id]
-        );
+        const result = await pool.query('UPDATE negocios SET tema = $1 WHERE id = $2 AND usuario_id = $3 RETURNING *', [tema, req.params.id, req.usuario_id]);
         if(result.rowCount === 0) return res.status(403).json({error: 'No eres el dueño de esta marca'});
         res.json(result.rows[0]);
     } catch (error) {
@@ -293,7 +288,7 @@ app.get('/api/movimientos', verificarToken, async (req, res) => {
         `SELECT m.*, n.nombre as empresa_nombre FROM movimientos_tesoreria m 
          JOIN negocios n ON m.negocio_id = n.id 
          WHERE n.usuario_id = $1 OR n.id IN (SELECT negocio_id FROM colaboradores WHERE email_colaborador = $2) 
-         ORDER BY m.fecha_registro DESC`, 
+         ORDER BY m.fecha_registro ASC`, // Cambiado a ASC para los graficos historicos
         [req.usuario_id, req.usuario_email]
     );
     res.json(result.rows);
@@ -301,10 +296,7 @@ app.get('/api/movimientos', verificarToken, async (req, res) => {
 
 app.get('/api/deudas/:negocio_id', verificarToken, async (req, res) => {
     try {
-        const result = await pool.query(
-            `SELECT * FROM movimientos_tesoreria WHERE negocio_id = $1 AND estado_pago = 'pendiente' ORDER BY fecha_vencimiento ASC`, 
-            [req.params.negocio_id]
-        );
+        const result = await pool.query(`SELECT * FROM movimientos_tesoreria WHERE negocio_id = $1 AND estado_pago = 'pendiente' ORDER BY fecha_vencimiento ASC`, [req.params.negocio_id]);
         res.json(result.rows);
     } catch (error) { 
         res.status(500).json({ error: 'Error deudas' }); 
@@ -421,4 +413,4 @@ app.post('/api/whatsapp', async (req, res) => {
     } catch (error) { res.send('<Response><Message>❌ Error en servidor.</Message></Response>'); }
 });
 
-app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port} (Oráculo + Branding)`); });
+app.listen(port, () => { console.log(`🔒 Servidor en puerto ${port}`); });
