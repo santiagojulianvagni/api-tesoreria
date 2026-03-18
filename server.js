@@ -1,4 +1,4 @@
-// server.js - API Backend (Conectado a Neon.tech en AWS)
+// server.js - API Backend (Con Panel de Superadministrador)
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -6,16 +6,14 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-const port = process.env.PORT || 3000; 
-// ^ Esto le dice al servidor: "Usa el puerto de Render, o el 3000 si estoy en mi compu"
+const port = process.env.PORT || 3000;
 const SECRET_KEY = 'super_clave_secreta_financiera_2026'; 
 
 app.use(cors());
 app.use(express.json());
 
-// NUEVA CONEXIÓN A LA NUBE
 const pool = new Pool({
-    connectionString: 'postgresql://neondb_owner:npg_ISxCvM4w6jko@ep-still-river-an6gel8k-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require',
+    connectionString: 'postgresql://neondb_owner:npg_ISxCvM4w6jko@ep-still-river-an6gel8k-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
     ssl: { rejectUnauthorized: false }
 });
 
@@ -64,6 +62,23 @@ app.delete('/api/usuarios', verificarToken, async (req, res) => {
         await pool.query('DELETE FROM usuarios WHERE id = $1', [req.usuario_id]);
         res.json({ mensaje: 'Cuenta eliminada permanentemente' });
     } catch (error) { res.status(500).json({ error: 'Error al eliminar cuenta' }); }
+});
+
+// --- NUEVO: RUTA SUPERADMINISTRADOR ---
+app.get('/api/admin/stats', verificarToken, async (req, res) => {
+    if (req.usuario_id !== 1) return res.status(403).json({ error: 'Acceso denegado. Se requieren permisos de Fundador.' });
+    
+    try {
+        const users = await pool.query('SELECT COUNT(*) FROM usuarios');
+        const negocios = await pool.query('SELECT COUNT(*) FROM negocios');
+        const movs = await pool.query('SELECT COUNT(*) FROM movimientos_tesoreria');
+        
+        res.json({
+            total_usuarios: users.rows[0].count,
+            total_negocios: negocios.rows[0].count,
+            total_movimientos: movs.rows[0].count
+        });
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo métricas' }); }
 });
 
 // --- RUTAS DE NEGOCIOS ---
